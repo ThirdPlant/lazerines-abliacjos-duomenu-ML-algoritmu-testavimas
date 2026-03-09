@@ -11,8 +11,8 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
-INPUT_COLUMNS = ["N", "P", "F0", "Gylis"]
-TARGET_COLUMN = "Ra"
+INPUT_COLUMNS = ["N", "P", "F0"]
+TARGET_COLUMN = "Gylis"
 N_SCAN_VALUE = 3
 N_SPLITS = 5
 CV_SEEDS = [0, 1, 2, 3, 4]
@@ -23,7 +23,7 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def build_preprocessor() -> ColumnTransformer:
-    # N is kept numeric (no one-hot). P, F0, and Gylis are log-scaled due to skew.
+    # N is kept numeric (no one-hot). P and F0 are log-scaled due to skew.
     pf_pipe = Pipeline(
         [
             ("log1p", FunctionTransformer(np.log1p, validate=False)),
@@ -33,7 +33,7 @@ def build_preprocessor() -> ColumnTransformer:
     return ColumnTransformer(
         [
             ("n_scale", StandardScaler(), ["N"]),
-            ("pf_log_scale", pf_pipe, ["P", "F0", "Gylis"]),
+            ("pf_log_scale", pf_pipe, ["P", "F0"]),
         ],
         remainder="drop",
     )
@@ -49,7 +49,7 @@ def load_data(file_path: str) -> pd.DataFrame:
 
 
 def remove_definite_outliers(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    # Strict outlier rule on target only: Ra outside [Q1 - 3*IQR, Q3 + 3*IQR].
+    # Strict outlier rule on target only: values outside [Q1 - 3*IQR, Q3 + 3*IQR].
     q1 = float(df[TARGET_COLUMN].quantile(0.25))
     q3 = float(df[TARGET_COLUMN].quantile(0.75))
     iqr = q3 - q1
@@ -67,6 +67,7 @@ def evaluate_candidate(
     y: np.ndarray,
     params: dict,
     cv_seeds: list[int],
+    use_log_target: bool,
 ) -> tuple[float, float, float]:
     scores = []
     seed_means = []
@@ -84,8 +85,7 @@ def evaluate_candidate(
             X_train = preprocessor.fit_transform(X_train_df)
             X_test = preprocessor.transform(X_test_df)
 
-            # Forced log-transform on target Ra.
-            y_train_model = np.log1p(y_train)
+            y_train_model = np.log1p(y_train) if use_log_target else y_train
 
             kernel = (
                 ConstantKernel(
@@ -111,8 +111,8 @@ def evaluate_candidate(
                 random_state=seed,
             )
             model.fit(X_train, y_train_model)
-            y_pred_log = model.predict(X_test)
-            y_pred = np.expm1(y_pred_log)
+            y_pred_model = model.predict(X_test)
+            y_pred = np.expm1(y_pred_model) if use_log_target else y_pred_model
             fold_rmse = rmse(y_test, y_pred)
             scores.append(fold_rmse)
             seed_scores.append(fold_rmse)
@@ -122,6 +122,53 @@ def evaluate_candidate(
     arr = np.array(scores, dtype=float)
     seed_arr = np.array(seed_means, dtype=float)
     return float(arr.mean()), float(arr.std()), float(seed_arr.std())
+
+
+def choose_target_transform(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[int]) -> bool:
+    strategies: list[tuple[str, bool]] = [("none", False)]
+    if np.any(y <= -1.0):
+        print(
+            "Skipping log1p target strategy because target contains values <= -1. "
+            "Using no target transform."
+        )
+    else:
+        strategies.append(("log1p", True))
+
+    baseline_params = {
+        "c_value": 1.0,
+        "length_scale": 1.0,
+        "noise_level": 1e-3,
+        "alpha": 1e-8,
+        "matern_nu": 2.5,
+    }
+
+    rows = []
+    for name, use_log_target in strategies:
+        rmse_mean, rmse_std, rmse_std_seed = evaluate_candidate(
+            X_df=X_df,
+            y=y,
+            params=baseline_params,
+            cv_seeds=cv_seeds,
+            use_log_target=use_log_target,
+        )
+        row = {
+            "name": name,
+            "use_log_target": use_log_target,
+            "rmse_mean": rmse_mean,
+            "rmse_std": rmse_std,
+            "rmse_std_seed": rmse_std_seed,
+        }
+        rows.append(row)
+        print(
+            f"Target strategy {name}: mean={rmse_mean:.6f}, fold_std={rmse_std:.6f}, "
+            f"seed_std={rmse_std_seed:.6f}"
+        )
+
+    strategy_df = pd.DataFrame(rows)
+    best = strategy_df.sort_values(["rmse_mean", "rmse_std"], ascending=[True, True]).iloc[0]
+    print("\nChosen target transform:")
+    print(best.to_dict())
+    return bool(best["use_log_target"])
 
 
 def summarize_trials(results: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -164,11 +211,12 @@ def bayesian_optimize(
     X_df: pd.DataFrame,
     y: np.ndarray,
     cv_seeds: list[int],
+    use_log_target: bool,
     max_trials: int | None,
 ) -> pd.DataFrame:
     ax_client = AxClient(random_seed=123, verbose_logging=False)
     ax_client.create_experiment(
-        name="gp_matern_ra_continuous",
+        name="gp_matern_gylis_continuous",
         parameters=[
             {
                 "name": "c_value",
@@ -228,6 +276,7 @@ def bayesian_optimize(
                 y=y,
                 params=params,
                 cv_seeds=cv_seeds,
+                use_log_target=use_log_target,
             )
             ax_client.complete_trial(trial_index=trial_index, raw_data={"rmse_mean": rmse_mean})
         except KeyboardInterrupt:
@@ -315,11 +364,20 @@ def bayesian_optimize(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Continuous Bayesian optimization for Ra with GP kernel "
+            "Continuous Bayesian optimization for Gylis with GP kernel "
             "C*Matern(nu in {1.5, 2.5}) + WhiteKernel, 5-fold CV over 5 seeds."
         )
     )
     parser.add_argument("--file", type=str, default="surikiuoti_duomenys.xlsx")
+    parser.add_argument(
+        "--log-target",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "Target transform mode: auto compares none vs log1p on baseline CV, "
+            "on always applies log1p, off disables target log transform."
+        ),
+    )
     parser.add_argument(
         "--max-trials",
         type=int,
@@ -329,8 +387,9 @@ def main() -> None:
     args = parser.parse_args()
 
     print(f"Configuration: Nscan={N_SCAN_VALUE}, seeds={CV_SEEDS}, folds={N_SPLITS}")
-    print("Input handling: N kept numeric (no one-hot), P/F0/Gylis log1p+scaled")
-    print("Target handling: forced log1p transform on Ra")
+    print("Input handling: N kept numeric (no one-hot), P/F0 log1p+scaled")
+    print(f"Target: {TARGET_COLUMN}")
+    print(f"Target transform mode: {args.log_target}")
     print("Kernel: C*Matern(nu={1.5, 2.5}) + WhiteKernel")
     if args.max_trials is None:
         print("Optimization mode: continuous (press Ctrl+C to stop)\n")
@@ -340,20 +399,29 @@ def main() -> None:
     df = load_data(args.file)
     print(f"Rows after base filtering: {len(df)}")
 
-    df, outlier_info = remove_definite_outliers(df)
-    print(
-        f"Outlier filter on Ra (3*IQR): removed={outlier_info['removed']}, "
-        f"bounds=({outlier_info['lower']:.6f}, {outlier_info['upper']:.6f}), "
-        f"rows_left={len(df)}\n"
-    )
+    print("Outlier filtering: disabled (no rows removed)\n")
 
     X_df = df[INPUT_COLUMNS].copy()
     y = df[TARGET_COLUMN].to_numpy(dtype=float)
+
+    if args.log_target == "on":
+        if np.any(y <= -1.0):
+            raise ValueError(
+                f"Cannot use --log-target on: {TARGET_COLUMN} contains values <= -1 (log1p invalid)."
+            )
+        use_log_target = True
+    elif args.log_target == "off":
+        use_log_target = False
+    else:
+        use_log_target = choose_target_transform(X_df=X_df, y=y, cv_seeds=CV_SEEDS)
+
+    print(f"Using log-transform on {TARGET_COLUMN}: {use_log_target}\n")
 
     results = bayesian_optimize(
         X_df=X_df,
         y=y,
         cv_seeds=CV_SEEDS,
+        use_log_target=use_log_target,
         max_trials=args.max_trials,
     )
 
