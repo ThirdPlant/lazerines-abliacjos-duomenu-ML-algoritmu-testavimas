@@ -12,8 +12,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
 INPUT_COLUMNS = ["N", "P", "F0"]
-TARGET_COLUMN = "Gylis"
-N_SCAN_VALUE = 3
+TARGET_COLUMN = "Ra"
 N_SPLITS = 5
 CV_SEEDS = [0, 1, 2, 3, 4]
 
@@ -22,44 +21,37 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
 
-def build_preprocessor() -> ColumnTransformer:
-    # N is kept numeric (no one-hot). P and F0 are log-scaled due to skew.
-    pf_pipe = Pipeline(
-        [
-            ("log1p", FunctionTransformer(np.log1p, validate=False)),
-            ("scale", StandardScaler()),
-        ]
-    )
-    return ColumnTransformer(
-        [
-            ("n_scale", StandardScaler(), ["N"]),
-            ("pf_log_scale", pf_pipe, ["P", "F0"]),
-        ],
-        remainder="drop",
-    )
+def build_preprocessor(mode: str) -> ColumnTransformer:
+    if mode == "raw":
+        return ColumnTransformer([("raw", "passthrough", INPUT_COLUMNS)], remainder="drop")
+
+    if mode == "scale_all":
+        return ColumnTransformer([("scale", StandardScaler(), INPUT_COLUMNS)], remainder="drop")
+
+    if mode == "n_scale_pf_log_scale":
+        pf_pipe = Pipeline(
+            [
+                ("log1p", FunctionTransformer(np.log1p, validate=False)),
+                ("scale", StandardScaler()),
+            ]
+        )
+        return ColumnTransformer(
+            [
+                ("n_scale", StandardScaler(), ["N"]),
+                ("pf_log_scale", pf_pipe, ["P", "F0"]),
+            ],
+            remainder="drop",
+        )
+
+    raise ValueError(f"Unknown feature mode: {mode}")
 
 
 def load_data(file_path: str) -> pd.DataFrame:
     df = pd.read_excel(file_path)
-    df = df[df["Nscan"] == N_SCAN_VALUE].copy()
     df = df.dropna(subset=INPUT_COLUMNS + [TARGET_COLUMN]).reset_index(drop=True)
     if df.empty:
-        raise ValueError(f"No rows available after filtering Nscan == {N_SCAN_VALUE}.")
+        raise ValueError("No rows available after dropping missing values.")
     return df
-
-
-def remove_definite_outliers(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    # Strict outlier rule on target only: values outside [Q1 - 3*IQR, Q3 + 3*IQR].
-    q1 = float(df[TARGET_COLUMN].quantile(0.25))
-    q3 = float(df[TARGET_COLUMN].quantile(0.75))
-    iqr = q3 - q1
-    lower = q1 - 3.0 * iqr
-    upper = q3 + 3.0 * iqr
-
-    keep_mask = df[TARGET_COLUMN].between(lower, upper, inclusive="both")
-    removed = int((~keep_mask).sum())
-    filtered = df.loc[keep_mask].reset_index(drop=True)
-    return filtered, {"lower": lower, "upper": upper, "removed": removed}
 
 
 def evaluate_candidate(
@@ -68,6 +60,7 @@ def evaluate_candidate(
     params: dict,
     cv_seeds: list[int],
     use_log_target: bool,
+    feature_mode: str,
 ) -> tuple[float, float, float]:
     scores = []
     seed_means = []
@@ -81,7 +74,7 @@ def evaluate_candidate(
             y_train = y[train_idx]
             y_test = y[test_idx]
 
-            preprocessor = build_preprocessor()
+            preprocessor = build_preprocessor(feature_mode)
             X_train = preprocessor.fit_transform(X_train_df)
             X_test = preprocessor.transform(X_test_df)
 
@@ -124,16 +117,7 @@ def evaluate_candidate(
     return float(arr.mean()), float(arr.std()), float(seed_arr.std())
 
 
-def choose_target_transform(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[int]) -> bool:
-    strategies: list[tuple[str, bool]] = [("none", False)]
-    if np.any(y <= -1.0):
-        print(
-            "Skipping log1p target strategy because target contains values <= -1. "
-            "Using no target transform."
-        )
-    else:
-        strategies.append(("log1p", True))
-
+def choose_transforms(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[int]) -> tuple[str, bool]:
     baseline_params = {
         "c_value": 1.0,
         "length_scale": 1.0,
@@ -142,33 +126,38 @@ def choose_target_transform(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[in
         "matern_nu": 2.5,
     }
 
+    feature_modes = ["raw", "scale_all", "n_scale_pf_log_scale"]
+    target_modes = [False, True] if not np.any(y <= -1.0) else [False]
+
     rows = []
-    for name, use_log_target in strategies:
-        rmse_mean, rmse_std, rmse_std_seed = evaluate_candidate(
-            X_df=X_df,
-            y=y,
-            params=baseline_params,
-            cv_seeds=cv_seeds,
-            use_log_target=use_log_target,
-        )
-        row = {
-            "name": name,
-            "use_log_target": use_log_target,
-            "rmse_mean": rmse_mean,
-            "rmse_std": rmse_std,
-            "rmse_std_seed": rmse_std_seed,
-        }
-        rows.append(row)
-        print(
-            f"Target strategy {name}: mean={rmse_mean:.6f}, fold_std={rmse_std:.6f}, "
-            f"seed_std={rmse_std_seed:.6f}"
-        )
+    for feature_mode in feature_modes:
+        for use_log_target in target_modes:
+            mean_rmse, fold_std, seed_std = evaluate_candidate(
+                X_df=X_df,
+                y=y,
+                params=baseline_params,
+                cv_seeds=cv_seeds,
+                use_log_target=use_log_target,
+                feature_mode=feature_mode,
+            )
+            row = {
+                "feature_mode": feature_mode,
+                "use_log_target": use_log_target,
+                "rmse_mean": mean_rmse,
+                "rmse_std": fold_std,
+                "rmse_std_seed": seed_std,
+            }
+            rows.append(row)
+            print(
+                f"Transform strategy feature={feature_mode}, log_target={use_log_target}: "
+                f"mean={mean_rmse:.6f}, fold_std={fold_std:.6f}, seed_std={seed_std:.6f}"
+            )
 
     strategy_df = pd.DataFrame(rows)
     best = strategy_df.sort_values(["rmse_mean", "rmse_std"], ascending=[True, True]).iloc[0]
-    print("\nChosen target transform:")
+    print("\nChosen transform strategy:")
     print(best.to_dict())
-    return bool(best["use_log_target"])
+    return str(best["feature_mode"]), bool(best["use_log_target"])
 
 
 def summarize_trials(results: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -212,11 +201,12 @@ def bayesian_optimize(
     y: np.ndarray,
     cv_seeds: list[int],
     use_log_target: bool,
+    feature_mode: str,
     max_trials: int | None,
 ) -> pd.DataFrame:
     ax_client = AxClient(random_seed=123, verbose_logging=False)
     ax_client.create_experiment(
-        name="gp_matern_gylis_continuous",
+        name="gp_matern_ra_continuous",
         parameters=[
             {
                 "name": "c_value",
@@ -277,6 +267,7 @@ def bayesian_optimize(
                 params=params,
                 cv_seeds=cv_seeds,
                 use_log_target=use_log_target,
+                feature_mode=feature_mode,
             )
             ax_client.complete_trial(trial_index=trial_index, raw_data={"rmse_mean": rmse_mean})
         except KeyboardInterrupt:
@@ -295,6 +286,8 @@ def bayesian_optimize(
             "rmse_mean": rmse_mean,
             "rmse_std": rmse_std,
             "rmse_std_seed": rmse_std_seed,
+            "feature_mode": feature_mode,
+            "use_log_target": bool(use_log_target),
             "c_value": float(params["c_value"]),
             "length_scale": float(params["length_scale"]),
             "noise_level": float(params["noise_level"]),
@@ -312,6 +305,7 @@ def bayesian_optimize(
         print(
             f"Trial {trial_no} | RMSE mean={rmse_mean:.6f}, fold_std={rmse_std:.6f}, "
             f"seed_std={rmse_std_seed:.6f} | "
+            f"feature_mode={feature_mode}, log_target={use_log_target} | "
             f"C={row['c_value']:.6g}, ls={row['length_scale']:.6g}, "
             f"noise={row['noise_level']:.6g}, alpha={row['alpha']:.6g}, nu={row['matern_nu']}"
         )
@@ -325,6 +319,7 @@ def bayesian_optimize(
             "Best RMSE so far: "
             f"mean={best_mean['rmse_mean']:.6f}, fold_std={best_mean['rmse_std']:.6f}, "
             f"seed_std={best_mean['rmse_std_seed']:.6f}, "
+            f"feature_mode={best_mean['feature_mode']}, log_target={bool(best_mean['use_log_target'])}, "
             f"params={{C={best_mean['c_value']:.6g}, ls={best_mean['length_scale']:.6g}, "
             f"noise={best_mean['noise_level']:.6g}, alpha={best_mean['alpha']:.6g}, "
             f"nu={best_mean['matern_nu']}}}"
@@ -339,6 +334,8 @@ def bayesian_optimize(
             "Best balance so far: "
             f"mean={best_balance['rmse_mean']:.6f}, fold_std={best_balance['rmse_std']:.6f}, "
             f"seed_std={best_balance['rmse_std_seed']:.6f}, "
+            f"feature_mode={best_balance['feature_mode']}, "
+            f"log_target={bool(best_balance['use_log_target'])}, "
             f"params={{C={best_balance['c_value']:.6g}, ls={best_balance['length_scale']:.6g}, "
             f"noise={best_balance['noise_level']:.6g}, alpha={best_balance['alpha']:.6g}, "
             f"nu={best_balance['matern_nu']}}}"
@@ -353,6 +350,7 @@ def bayesian_optimize(
             "Best std so far: "
             f"mean={best_std['rmse_mean']:.6f}, fold_std={best_std['rmse_std']:.6f}, "
             f"seed_std={best_std['rmse_std_seed']:.6f}, "
+            f"feature_mode={best_std['feature_mode']}, log_target={bool(best_std['use_log_target'])}, "
             f"params={{C={best_std['c_value']:.6g}, ls={best_std['length_scale']:.6g}, "
             f"noise={best_std['noise_level']:.6g}, alpha={best_std['alpha']:.6g}, "
             f"nu={best_std['matern_nu']}}}\n"
@@ -364,20 +362,11 @@ def bayesian_optimize(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Continuous Bayesian optimization for Gylis with GP kernel "
-            "C*Matern(nu in {1.5, 2.5}) + WhiteKernel, 5-fold CV over 5 seeds."
+            "Continuous Bayesian optimization for Ra with GP kernel "
+            "C*Matern(nu in {1.5, 2.5}) + WhiteKernel."
         )
     )
-    parser.add_argument("--file", type=str, default="surikiuoti_duomenys.xlsx")
-    parser.add_argument(
-        "--log-target",
-        choices=["auto", "on", "off"],
-        default="auto",
-        help=(
-            "Target transform mode: auto compares none vs log1p on baseline CV, "
-            "on always applies log1p, off disables target log transform."
-        ),
-    )
+    parser.add_argument("--file", type=str, default="surikiuoti_duomenys_Nscan_3.xlsx")
     parser.add_argument(
         "--max-trials",
         type=int,
@@ -386,11 +375,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    print(f"Configuration: Nscan={N_SCAN_VALUE}, seeds={CV_SEEDS}, folds={N_SPLITS}")
-    print("Input handling: N kept numeric (no one-hot), P/F0 log1p+scaled")
+    print(f"Configuration: seeds={CV_SEEDS}, folds={N_SPLITS}")
     print(f"Target: {TARGET_COLUMN}")
-    print(f"Target transform mode: {args.log_target}")
-    print("Kernel: C*Matern(nu={1.5, 2.5}) + WhiteKernel")
+    print("Outlier filtering: disabled (no rows removed)")
     if args.max_trials is None:
         print("Optimization mode: continuous (press Ctrl+C to stop)\n")
     else:
@@ -399,22 +386,11 @@ def main() -> None:
     df = load_data(args.file)
     print(f"Rows after base filtering: {len(df)}")
 
-    print("Outlier filtering: disabled (no rows removed)\n")
-
     X_df = df[INPUT_COLUMNS].copy()
     y = df[TARGET_COLUMN].to_numpy(dtype=float)
 
-    if args.log_target == "on":
-        if np.any(y <= -1.0):
-            raise ValueError(
-                f"Cannot use --log-target on: {TARGET_COLUMN} contains values <= -1 (log1p invalid)."
-            )
-        use_log_target = True
-    elif args.log_target == "off":
-        use_log_target = False
-    else:
-        use_log_target = choose_target_transform(X_df=X_df, y=y, cv_seeds=CV_SEEDS)
-
+    feature_mode, use_log_target = choose_transforms(X_df=X_df, y=y, cv_seeds=CV_SEEDS)
+    print(f"\nChosen feature mode: {feature_mode}")
     print(f"Using log-transform on {TARGET_COLUMN}: {use_log_target}\n")
 
     results = bayesian_optimize(
@@ -422,6 +398,7 @@ def main() -> None:
         y=y,
         cv_seeds=CV_SEEDS,
         use_log_target=use_log_target,
+        feature_mode=feature_mode,
         max_trials=args.max_trials,
     )
 
