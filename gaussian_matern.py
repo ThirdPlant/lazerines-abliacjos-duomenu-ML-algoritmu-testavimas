@@ -86,7 +86,14 @@ def evaluate_candidate(
                     constant_value_bounds="fixed",
                 )
                 * Matern(
-                    length_scale=float(params["length_scale"]),
+                    length_scale=np.array(
+                        [
+                            float(params["length_scale_n"]),
+                            float(params["length_scale_p"]),
+                            float(params["length_scale_f0"]),
+                        ],
+                        dtype=float,
+                    ),
                     length_scale_bounds="fixed",
                     nu=float(params["matern_nu"]),
                 )
@@ -120,7 +127,9 @@ def evaluate_candidate(
 def choose_transforms(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[int]) -> tuple[str, bool]:
     baseline_params = {
         "c_value": 1.0,
-        "length_scale": 1.0,
+        "length_scale_n": 1.0,
+        "length_scale_p": 1.0,
+        "length_scale_f0": 1.0,
         "noise_level": 1e-3,
         "alpha": 1e-8,
         "matern_nu": 2.5,
@@ -175,7 +184,9 @@ def summarize_trials(results: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Se
 def row_to_parameterization(row: pd.Series | dict) -> dict:
     return {
         "c_value": float(row["c_value"]),
-        "length_scale": float(row["length_scale"]),
+        "length_scale_n": float(row["length_scale_n"]),
+        "length_scale_p": float(row["length_scale_p"]),
+        "length_scale_f0": float(row["length_scale_f0"]),
         "noise_level": float(row["noise_level"]),
         "alpha": float(row["alpha"]),
         "matern_nu": float(row["matern_nu"]),
@@ -216,7 +227,21 @@ def bayesian_optimize(
                 "log_scale": True,
             },
             {
-                "name": "length_scale",
+                "name": "length_scale_n",
+                "type": "range",
+                "bounds": [1e-3, 100.0],
+                "value_type": "float",
+                "log_scale": True,
+            },
+            {
+                "name": "length_scale_p",
+                "type": "range",
+                "bounds": [1e-3, 100.0],
+                "value_type": "float",
+                "log_scale": True,
+            },
+            {
+                "name": "length_scale_f0",
                 "type": "range",
                 "bounds": [1e-3, 100.0],
                 "value_type": "float",
@@ -289,7 +314,9 @@ def bayesian_optimize(
             "feature_mode": feature_mode,
             "use_log_target": bool(use_log_target),
             "c_value": float(params["c_value"]),
-            "length_scale": float(params["length_scale"]),
+            "length_scale_n": float(params["length_scale_n"]),
+            "length_scale_p": float(params["length_scale_p"]),
+            "length_scale_f0": float(params["length_scale_f0"]),
             "noise_level": float(params["noise_level"]),
             "alpha": float(params["alpha"]),
             "matern_nu": float(params["matern_nu"]),
@@ -306,7 +333,8 @@ def bayesian_optimize(
             f"Trial {trial_no} | RMSE mean={rmse_mean:.6f}, fold_std={rmse_std:.6f}, "
             f"seed_std={rmse_std_seed:.6f} | "
             f"feature_mode={feature_mode}, log_target={use_log_target} | "
-            f"C={row['c_value']:.6g}, ls={row['length_scale']:.6g}, "
+            f"C={row['c_value']:.6g}, ls_n={row['length_scale_n']:.6g}, "
+            f"ls_p={row['length_scale_p']:.6g}, ls_f0={row['length_scale_f0']:.6g}, "
             f"noise={row['noise_level']:.6g}, alpha={row['alpha']:.6g}, nu={row['matern_nu']}"
         )
         if pred_current is not None:
@@ -320,7 +348,8 @@ def bayesian_optimize(
             f"mean={best_mean['rmse_mean']:.6f}, fold_std={best_mean['rmse_std']:.6f}, "
             f"seed_std={best_mean['rmse_std_seed']:.6f}, "
             f"feature_mode={best_mean['feature_mode']}, log_target={bool(best_mean['use_log_target'])}, "
-            f"params={{C={best_mean['c_value']:.6g}, ls={best_mean['length_scale']:.6g}, "
+            f"params={{C={best_mean['c_value']:.6g}, ls_n={best_mean['length_scale_n']:.6g}, "
+            f"ls_p={best_mean['length_scale_p']:.6g}, ls_f0={best_mean['length_scale_f0']:.6g}, "
             f"noise={best_mean['noise_level']:.6g}, alpha={best_mean['alpha']:.6g}, "
             f"nu={best_mean['matern_nu']}}}"
         )
@@ -336,7 +365,8 @@ def bayesian_optimize(
             f"seed_std={best_balance['rmse_std_seed']:.6f}, "
             f"feature_mode={best_balance['feature_mode']}, "
             f"log_target={bool(best_balance['use_log_target'])}, "
-            f"params={{C={best_balance['c_value']:.6g}, ls={best_balance['length_scale']:.6g}, "
+            f"params={{C={best_balance['c_value']:.6g}, ls_n={best_balance['length_scale_n']:.6g}, "
+            f"ls_p={best_balance['length_scale_p']:.6g}, ls_f0={best_balance['length_scale_f0']:.6g}, "
             f"noise={best_balance['noise_level']:.6g}, alpha={best_balance['alpha']:.6g}, "
             f"nu={best_balance['matern_nu']}}}"
         )
@@ -351,7 +381,8 @@ def bayesian_optimize(
             f"mean={best_std['rmse_mean']:.6f}, fold_std={best_std['rmse_std']:.6f}, "
             f"seed_std={best_std['rmse_std_seed']:.6f}, "
             f"feature_mode={best_std['feature_mode']}, log_target={bool(best_std['use_log_target'])}, "
-            f"params={{C={best_std['c_value']:.6g}, ls={best_std['length_scale']:.6g}, "
+            f"params={{C={best_std['c_value']:.6g}, ls_n={best_std['length_scale_n']:.6g}, "
+            f"ls_p={best_std['length_scale_p']:.6g}, ls_f0={best_std['length_scale_f0']:.6g}, "
             f"noise={best_std['noise_level']:.6g}, alpha={best_std['alpha']:.6g}, "
             f"nu={best_std['matern_nu']}}}\n"
         )

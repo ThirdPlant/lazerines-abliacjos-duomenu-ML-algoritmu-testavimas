@@ -5,7 +5,8 @@ import pandas as pd
 from ax.service.ax_client import AxClient
 from ax.service.utils.instantiation import ObjectiveProperties
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
@@ -49,7 +50,7 @@ def load_data(file_path: str) -> pd.DataFrame:
     df = pd.read_excel(file_path)
     df = df.dropna(subset=INPUT_COLUMNS + [TARGET_COLUMN]).reset_index(drop=True)
     if df.empty:
-        raise ValueError("No rows left after dropping missing values.")
+        raise ValueError("No rows available after dropping missing values.")
     return df
 
 
@@ -61,13 +62,12 @@ def evaluate_candidate(
     use_log_target: bool,
     feature_mode: str,
 ) -> tuple[float, float, float]:
-    fold_scores = []
+    scores = []
     seed_means = []
 
     for seed in cv_seeds:
-        kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=seed)
         seed_scores = []
-
+        kf = KFold(n_splits=N_SPLITS, shuffle=True, random_state=seed)
         for train_idx, test_idx in kf.split(X_df):
             X_train_df = X_df.iloc[train_idx]
             X_test_df = X_df.iloc[test_idx]
@@ -80,40 +80,58 @@ def evaluate_candidate(
 
             y_train_model = np.log1p(y_train) if use_log_target else y_train
 
-            model = HistGradientBoostingRegressor(
-                loss="squared_error",
-                learning_rate=float(params["learning_rate"]),
-                max_depth=int(params["max_depth"]),
-                max_iter=int(params["max_iter"]),
-                min_samples_leaf=int(params["min_samples_leaf"]),
-                l2_regularization=float(params["l2_regularization"]),
-                max_leaf_nodes=int(params["max_leaf_nodes"]),
-                early_stopping=False,
+            kernel = (
+                ConstantKernel(
+                    constant_value=float(params["c_value"]),
+                    constant_value_bounds="fixed",
+                )
+                * Matern(
+                    length_scale=np.array(
+                        [
+                            float(params["length_scale_n"]),
+                            float(params["length_scale_p"]),
+                            float(params["length_scale_f0"]),
+                        ],
+                        dtype=float,
+                    ),
+                    length_scale_bounds="fixed",
+                    nu=1.5,
+                )
+                + WhiteKernel(
+                    noise_level=float(params["noise_level"]),
+                    noise_level_bounds="fixed",
+                )
+            )
+
+            model = GaussianProcessRegressor(
+                kernel=kernel,
+                alpha=float(params["gpr_alpha"]),
+                optimizer=None,
+                normalize_y=True,
                 random_state=seed,
             )
             model.fit(X_train, y_train_model)
             y_pred_model = model.predict(X_test)
             y_pred = np.expm1(y_pred_model) if use_log_target else y_pred_model
-
-            score = rmse(y_test, y_pred)
-            fold_scores.append(score)
-            seed_scores.append(score)
+            fold_rmse = rmse(y_test, y_pred)
+            scores.append(fold_rmse)
+            seed_scores.append(fold_rmse)
 
         seed_means.append(float(np.mean(seed_scores)))
 
-    fold_arr = np.array(fold_scores, dtype=float)
+    arr = np.array(scores, dtype=float)
     seed_arr = np.array(seed_means, dtype=float)
-    return float(fold_arr.mean()), float(fold_arr.std()), float(seed_arr.std())
+    return float(arr.mean()), float(arr.std()), float(seed_arr.std())
 
 
 def choose_transforms(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[int]) -> tuple[str, bool]:
     baseline_params = {
-        "learning_rate": 0.05,
-        "max_depth": 6,
-        "max_iter": 500,
-        "min_samples_leaf": 10,
-        "l2_regularization": 0.0,
-        "max_leaf_nodes": 63,
+        "c_value": 1.0,
+        "length_scale_n": 1.0,
+        "length_scale_p": 1.0,
+        "length_scale_f0": 1.0,
+        "noise_level": 1e-3,
+        "gpr_alpha": 1e-8,
     }
 
     feature_modes = ["raw", "scale_all", "n_scale_pf_log_scale"]
@@ -134,8 +152,8 @@ def choose_transforms(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[int]) ->
                 "feature_mode": feature_mode,
                 "use_log_target": use_log_target,
                 "rmse_mean": mean_rmse,
-                "rmse_fold_std": fold_std,
-                "rmse_seed_std": seed_std,
+                "rmse_std": fold_std,
+                "rmse_std_seed": seed_std,
             }
             rows.append(row)
             print(
@@ -144,7 +162,7 @@ def choose_transforms(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[int]) ->
             )
 
     strategy_df = pd.DataFrame(rows)
-    best = strategy_df.sort_values(["rmse_mean", "rmse_fold_std"], ascending=[True, True]).iloc[0]
+    best = strategy_df.sort_values(["rmse_mean", "rmse_std"], ascending=[True, True]).iloc[0]
     print("\nChosen transform strategy:")
     print(best.to_dict())
     return str(best["feature_mode"]), bool(best["use_log_target"])
@@ -153,23 +171,23 @@ def choose_transforms(X_df: pd.DataFrame, y: np.ndarray, cv_seeds: list[int]) ->
 def summarize_trials(results: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
     work = results.copy()
     work["rank_mean"] = work["rmse_mean"].rank(method="min")
-    work["rank_std"] = work["rmse_fold_std"].rank(method="min")
+    work["rank_std"] = work["rmse_std"].rank(method="min")
     work["rank_sum"] = work["rank_mean"] + work["rank_std"]
 
-    best_mean = work.sort_values(["rmse_mean", "rmse_fold_std"], ascending=[True, True]).iloc[0]
-    best_std = work.sort_values(["rmse_fold_std", "rmse_mean"], ascending=[True, True]).iloc[0]
+    best_mean = work.sort_values(["rmse_mean", "rmse_std"], ascending=[True, True]).iloc[0]
+    best_std = work.sort_values(["rmse_std", "rmse_mean"], ascending=[True, True]).iloc[0]
     best_balance = work.sort_values(["rank_sum", "rmse_mean"], ascending=[True, True]).iloc[0]
     return best_mean, best_std, best_balance
 
 
 def row_to_parameterization(row: pd.Series | dict) -> dict:
     return {
-        "learning_rate": float(row["learning_rate"]),
-        "max_depth": int(row["max_depth"]),
-        "max_iter": int(row["max_iter"]),
-        "min_samples_leaf": int(row["min_samples_leaf"]),
-        "l2_regularization": float(row["l2_regularization"]),
-        "max_leaf_nodes": int(row["max_leaf_nodes"]),
+        "c_value": float(row["c_value"]),
+        "length_scale_n": float(row["length_scale_n"]),
+        "length_scale_p": float(row["length_scale_p"]),
+        "length_scale_f0": float(row["length_scale_f0"]),
+        "noise_level": float(row["noise_level"]),
+        "gpr_alpha": float(row["gpr_alpha"]),
     }
 
 
@@ -197,49 +215,53 @@ def bayesian_optimize(
 ) -> pd.DataFrame:
     ax_client = AxClient(random_seed=123, verbose_logging=False)
     ax_client.create_experiment(
-        name="hgb_gylis_continuous",
+        name="gp_matern15_ard_gylis_continuous",
         parameters=[
             {
-                "name": "learning_rate",
+                "name": "c_value",
                 "type": "range",
-                "bounds": [0.005, 0.3],
+                "bounds": [1e-3, 100.0],
                 "value_type": "float",
                 "log_scale": True,
             },
             {
-                "name": "max_depth",
+                "name": "length_scale_n",
                 "type": "range",
-                "bounds": [2, 14],
-                "value_type": "int",
-            },
-            {
-                "name": "max_iter",
-                "type": "range",
-                "bounds": [100, 2500],
-                "value_type": "int",
-            },
-            {
-                "name": "min_samples_leaf",
-                "type": "range",
-                "bounds": [1, 80],
-                "value_type": "int",
-            },
-            {
-                "name": "l2_regularization",
-                "type": "range",
-                "bounds": [1e-10, 20.0],
+                "bounds": [1e-3, 100.0],
                 "value_type": "float",
                 "log_scale": True,
             },
             {
-                "name": "max_leaf_nodes",
+                "name": "length_scale_p",
                 "type": "range",
-                "bounds": [15, 255],
-                "value_type": "int",
+                "bounds": [1e-3, 100.0],
+                "value_type": "float",
+                "log_scale": True,
+            },
+            {
+                "name": "length_scale_f0",
+                "type": "range",
+                "bounds": [1e-3, 100.0],
+                "value_type": "float",
+                "log_scale": True,
+            },
+            {
+                "name": "noise_level",
+                "type": "range",
+                "bounds": [1e-8, 1e-1],
+                "value_type": "float",
+                "log_scale": True,
+            },
+            {
+                "name": "gpr_alpha",
+                "type": "range",
+                "bounds": [1e-12, 1e-3],
+                "value_type": "float",
+                "log_scale": True,
             },
         ],
         objectives={"rmse_mean": ObjectiveProperties(minimize=True)},
-        choose_generation_strategy_kwargs={"force_random_search": True},
+        choose_generation_strategy_kwargs={"num_initialization_trials": 5},
         is_test=True,
     )
 
@@ -254,7 +276,7 @@ def bayesian_optimize(
         params = None
         try:
             params, trial_index = ax_client.get_next_trial()
-            rmse_mean, rmse_fold_std, rmse_seed_std = evaluate_candidate(
+            rmse_mean, rmse_std, rmse_std_seed = evaluate_candidate(
                 X_df=X_df,
                 y=y,
                 params=params,
@@ -268,8 +290,8 @@ def bayesian_optimize(
             break
         except Exception as exc:
             rmse_mean = 1e6
-            rmse_fold_std = 1e6
-            rmse_seed_std = 1e6
+            rmse_std = 1e6
+            rmse_std_seed = 1e6
             print(f"Trial {trial_no} failed: {exc}")
             if params is None:
                 continue
@@ -277,16 +299,16 @@ def bayesian_optimize(
         row = {
             "trial": trial_no,
             "rmse_mean": rmse_mean,
-            "rmse_fold_std": rmse_fold_std,
-            "rmse_seed_std": rmse_seed_std,
+            "rmse_std": rmse_std,
+            "rmse_std_seed": rmse_std_seed,
             "feature_mode": feature_mode,
             "use_log_target": bool(use_log_target),
-            "learning_rate": float(params["learning_rate"]),
-            "max_depth": int(params["max_depth"]),
-            "max_iter": int(params["max_iter"]),
-            "min_samples_leaf": int(params["min_samples_leaf"]),
-            "l2_regularization": float(params["l2_regularization"]),
-            "max_leaf_nodes": int(params["max_leaf_nodes"]),
+            "c_value": float(params["c_value"]),
+            "length_scale_n": float(params["length_scale_n"]),
+            "length_scale_p": float(params["length_scale_p"]),
+            "length_scale_f0": float(params["length_scale_f0"]),
+            "noise_level": float(params["noise_level"]),
+            "gpr_alpha": float(params["gpr_alpha"]),
         }
         trial_rows.append(row)
         results = pd.DataFrame(trial_rows)
@@ -297,61 +319,61 @@ def bayesian_optimize(
         pred_best_balance = get_surrogate_prediction(ax_client, row_to_parameterization(best_balance))
 
         print(
-            f"Trial {trial_no} | RMSE mean={rmse_mean:.6f}, fold_std={rmse_fold_std:.6f}, "
-            f"seed_std={rmse_seed_std:.6f} | feature_mode={feature_mode}, "
-            f"log_target={use_log_target} | lr={row['learning_rate']:.6g}, "
-            f"depth={row['max_depth']}, iter={row['max_iter']}, leaf={row['min_samples_leaf']}, "
-            f"l2={row['l2_regularization']:.6g}, max_leaf_nodes={row['max_leaf_nodes']}"
+            f"Trial {trial_no} | RMSE mean={rmse_mean:.6f}, fold_std={rmse_std:.6f}, "
+            f"seed_std={rmse_std_seed:.6f} | "
+            f"feature_mode={feature_mode}, log_target={use_log_target} | "
+            f"C={row['c_value']:.6g}, ls_n={row['length_scale_n']:.6g}, "
+            f"ls_p={row['length_scale_p']:.6g}, ls_f0={row['length_scale_f0']:.6g}, "
+            f"noise={row['noise_level']:.6g}, gpr_alpha={row['gpr_alpha']:.6g}"
         )
-
         if pred_current is not None:
-            print(f"Surrogate(current): pred_mean={pred_current[0]:.6f}, pred_sem={pred_current[1]:.6f}")
+            print(
+                f"Surrogate(current): pred_mean={pred_current[0]:.6f}, pred_sem={pred_current[1]:.6f}"
+            )
         else:
             print("Surrogate(current): unavailable (likely Sobol warm-up before GP surrogate fit)")
-
         print(
             "Best RMSE so far: "
-            f"mean={best_mean['rmse_mean']:.6f}, fold_std={best_mean['rmse_fold_std']:.6f}, "
-            f"seed_std={best_mean['rmse_seed_std']:.6f}, feature_mode={best_mean['feature_mode']}, "
-            f"log_target={bool(best_mean['use_log_target'])}, params={{lr={best_mean['learning_rate']:.6g}, "
-            f"depth={int(best_mean['max_depth'])}, iter={int(best_mean['max_iter'])}, "
-            f"leaf={int(best_mean['min_samples_leaf'])}, l2={best_mean['l2_regularization']:.6g}, "
-            f"max_leaf_nodes={int(best_mean['max_leaf_nodes'])}}}"
+            f"mean={best_mean['rmse_mean']:.6f}, fold_std={best_mean['rmse_std']:.6f}, "
+            f"seed_std={best_mean['rmse_std_seed']:.6f}, "
+            f"feature_mode={best_mean['feature_mode']}, log_target={bool(best_mean['use_log_target'])}, "
+            f"params={{C={best_mean['c_value']:.6g}, ls_n={best_mean['length_scale_n']:.6g}, "
+            f"ls_p={best_mean['length_scale_p']:.6g}, ls_f0={best_mean['length_scale_f0']:.6g}, "
+            f"noise={best_mean['noise_level']:.6g}, "
+            f"gpr_alpha={best_mean['gpr_alpha']:.6g}}}"
         )
-
         if pred_best_mean is not None:
             print(
                 f"Surrogate(best RMSE): pred_mean={pred_best_mean[0]:.6f}, pred_sem={pred_best_mean[1]:.6f}"
             )
         else:
             print("Surrogate(best RMSE): unavailable (likely Sobol warm-up before GP surrogate fit)")
-
         print(
             "Best balance so far: "
-            f"mean={best_balance['rmse_mean']:.6f}, fold_std={best_balance['rmse_fold_std']:.6f}, "
-            f"seed_std={best_balance['rmse_seed_std']:.6f}, feature_mode={best_balance['feature_mode']}, "
-            f"log_target={bool(best_balance['use_log_target'])}, params={{lr={best_balance['learning_rate']:.6g}, "
-            f"depth={int(best_balance['max_depth'])}, iter={int(best_balance['max_iter'])}, "
-            f"leaf={int(best_balance['min_samples_leaf'])}, l2={best_balance['l2_regularization']:.6g}, "
-            f"max_leaf_nodes={int(best_balance['max_leaf_nodes'])}}}"
+            f"mean={best_balance['rmse_mean']:.6f}, fold_std={best_balance['rmse_std']:.6f}, "
+            f"seed_std={best_balance['rmse_std_seed']:.6f}, "
+            f"feature_mode={best_balance['feature_mode']}, "
+            f"log_target={bool(best_balance['use_log_target'])}, "
+            f"params={{C={best_balance['c_value']:.6g}, ls_n={best_balance['length_scale_n']:.6g}, "
+            f"ls_p={best_balance['length_scale_p']:.6g}, ls_f0={best_balance['length_scale_f0']:.6g}, "
+            f"noise={best_balance['noise_level']:.6g}, "
+            f"gpr_alpha={best_balance['gpr_alpha']:.6g}}}"
         )
-
         if pred_best_balance is not None:
             print(
-                f"Surrogate(best balance): pred_mean={pred_best_balance[0]:.6f}, "
-                f"pred_sem={pred_best_balance[1]:.6f}"
+                f"Surrogate(best balance): pred_mean={pred_best_balance[0]:.6f}, pred_sem={pred_best_balance[1]:.6f}"
             )
         else:
             print("Surrogate(best balance): unavailable (likely Sobol warm-up before GP surrogate fit)")
-
         print(
             "Best std so far: "
-            f"mean={best_std['rmse_mean']:.6f}, fold_std={best_std['rmse_fold_std']:.6f}, "
-            f"seed_std={best_std['rmse_seed_std']:.6f}, feature_mode={best_std['feature_mode']}, "
-            f"log_target={bool(best_std['use_log_target'])}, params={{lr={best_std['learning_rate']:.6g}, "
-            f"depth={int(best_std['max_depth'])}, iter={int(best_std['max_iter'])}, "
-            f"leaf={int(best_std['min_samples_leaf'])}, l2={best_std['l2_regularization']:.6g}, "
-            f"max_leaf_nodes={int(best_std['max_leaf_nodes'])}}}\n"
+            f"mean={best_std['rmse_mean']:.6f}, fold_std={best_std['rmse_std']:.6f}, "
+            f"seed_std={best_std['rmse_std_seed']:.6f}, "
+            f"feature_mode={best_std['feature_mode']}, log_target={bool(best_std['use_log_target'])}, "
+            f"params={{C={best_std['c_value']:.6g}, ls_n={best_std['length_scale_n']:.6g}, "
+            f"ls_p={best_std['length_scale_p']:.6g}, ls_f0={best_std['length_scale_f0']:.6g}, "
+            f"noise={best_std['noise_level']:.6g}, "
+            f"gpr_alpha={best_std['gpr_alpha']:.6g}}}\n"
         )
 
     return pd.DataFrame(trial_rows)
@@ -360,8 +382,8 @@ def bayesian_optimize(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Continuous Bayesian optimization for HistGradientBoostingRegressor "
-            "predicting Gylis from N, P, F0."
+            "Continuous Bayesian optimization for Gylis with GP kernel "
+            "C*Matern(nu=1.5, ARD) + WhiteKernel."
         )
     )
     parser.add_argument("--file", type=str, default="surikiuoti_duomenys_Nscan_3.xlsx")
@@ -374,17 +396,15 @@ def main() -> None:
     args = parser.parse_args()
 
     print(f"Configuration: seeds={CV_SEEDS}, folds={N_SPLITS}")
-    print("Input features: N, P, F0 (N is numeric, not one-hot)")
-    print("Target: Gylis")
+    print(f"Target: {TARGET_COLUMN}")
     print("Outlier filtering: disabled (no rows removed)")
-    print("Candidate generation: fast random/Sobol search (no slow BoTorch phase)")
     if args.max_trials is None:
         print("Optimization mode: continuous (press Ctrl+C to stop)\n")
     else:
         print(f"Optimization mode: capped to {args.max_trials} trials\n")
 
     df = load_data(args.file)
-    print(f"Rows after basic filtering: {len(df)}\n")
+    print(f"Rows after base filtering: {len(df)}")
 
     X_df = df[INPUT_COLUMNS].copy()
     y = df[TARGET_COLUMN].to_numpy(dtype=float)
@@ -407,6 +427,7 @@ def main() -> None:
         return
 
     best_mean, best_std, best_balance = summarize_trials(results)
+
     print("Final best by mean RMSE:")
     print(best_mean.to_dict())
     print("\nFinal best by std:")
@@ -414,11 +435,7 @@ def main() -> None:
     print("\nFinal best balance:")
     print(best_balance.to_dict())
     print("\nTop 10 by mean RMSE:")
-    print(
-        results.sort_values(["rmse_mean", "rmse_fold_std"], ascending=[True, True])
-        .head(10)
-        .to_string(index=False)
-    )
+    print(results.sort_values(["rmse_mean", "rmse_std"], ascending=[True, True]).head(10).to_string(index=False))
 
 
 if __name__ == "__main__":
