@@ -1,50 +1,39 @@
-import itertools
-
 import matplotlib.pyplot as plt
 import pandas as pd
 
-INPUT_COLUMNS = ["N", "P", "F0"]
-OUTPUT_COLUMNS = ["Gylis", "Ra"]
-NSCAN_VALUE = 3
+FILE_PATH = "surikiuoti_duomenys_Nscan_3.xlsx"
+N_VALUE = 1.0
+REQUIRED_COLUMNS = ["N", "P", "F0", "Gylis"]
 
 
 def main() -> None:
-    df = pd.read_excel("surikiuoti_duomenys.xlsx")
-    df = df[df["Nscan"] == NSCAN_VALUE].copy()
-    df = df.dropna(subset=INPUT_COLUMNS + OUTPUT_COLUMNS).reset_index(drop=True)
+    df = pd.read_excel(FILE_PATH)
+    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"Faile truksta stulpeliu: {missing}")
+
+    df = df.dropna(subset=REQUIRED_COLUMNS).reset_index(drop=True)
+    df = df[df["N"].astype(float) == N_VALUE].copy()
 
     if df.empty:
-        raise ValueError(f"No rows left after filtering Nscan == {NSCAN_VALUE}.")
+        raise ValueError(f"Nerasta eiluciu su N == {N_VALUE}.")
 
-    input_pairs = list(itertools.combinations(INPUT_COLUMNS, 2))
-
-    fig = plt.figure(figsize=(18, 10))
-    plot_index = 1
-
-    for output_col in OUTPUT_COLUMNS:
-        for x_col, y_col in input_pairs:
-            ax = fig.add_subplot(
-                len(OUTPUT_COLUMNS),
-                len(input_pairs),
-                plot_index,
-                projection="3d",
-            )
-            scatter = ax.scatter(
-                df[x_col],
-                df[y_col],
-                df[output_col],
-                c=df[output_col],
-                cmap="viridis",
-                s=20,
-                alpha=0.85,
-            )
-            ax.set_xlabel(x_col)
-            ax.set_ylabel(y_col)
-            ax.set_zlabel(output_col)
-            #ax.set_title(f"{output_col} vs {x_col}, {y_col}")
-            fig.colorbar(scatter, ax=ax, shrink=0.65, pad=0.08, label=output_col)
-            plot_index += 1
-
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    scatter = ax.scatter(
+        df["F0"],
+        df["Gylis"],
+        c=df["P"],
+        cmap="viridis",
+        s=42,
+        alpha=0.9,
+        edgecolors="none",
+    )
+    ax.set_xlabel("F0")
+    ax.set_ylabel("Gylis")
+    ax.set_title(f"N = {N_VALUE:g}: Gylis vs F0 (spalva = P)")
+    ax.grid(True, alpha=0.3)
+    cbar = fig.colorbar(scatter, ax=ax)
+    cbar.set_label("P")
     plt.tight_layout()
     plt.show()
 

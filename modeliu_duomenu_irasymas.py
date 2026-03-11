@@ -5,62 +5,111 @@ import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 
 INPUT_COLUMNS = ["N", "P", "F0"]
-TARGET_COLUMN = "Gylis"
+RA_TARGET = "Ra"
+GYLIS_TARGET = "Gylis"
 
-# Fixed model from boosted_decision_tree.py "Best balance so far"
-FEATURE_MODE = "scale_all"
-USE_LOG_TARGET = True
-GYLIS_LEARNING_RATE = 0.170511
-GYLIS_MAX_DEPTH = 7
-GYLIS_MAX_ITER = 1614
-GYLIS_MIN_SAMPLES_LEAF = 30
-GYLIS_L2 = 1.13107e-05
-GYLIS_MAX_LEAF_NODES = 234
+# Fixed ARD Matern model for Ra
+RA_FEATURE_MODE = "scale_all"
+RA_USE_LOG_TARGET = True
+RA_PARAMS = {
+    "c_value": 0.42638329674243786,
+    "length_scale_n": 3.684816348935756,
+    "length_scale_p": 8.825687203522195,
+    "length_scale_f0": 100.0,
+    "noise_level": 1e-08,
+    "gpr_alpha": 4.556011373225105e-12,
+    "matern_nu": 2.5,
+}
+
+# Fixed ARD Matern model for Gylis
+GYLIS_FEATURE_MODE = "raw"
+GYLIS_USE_LOG_TARGET = False
+GYLIS_PARAMS = {
+    "c_value": 0.001,
+    "length_scale_n": 1.57227,
+    "length_scale_p": 0.0022466,
+    "length_scale_f0": 11.43,
+    "noise_level": 1e-08,
+    "gpr_alpha": 2.80953e-10,
+    "matern_nu": 2.5,
+}
 
 
-def build_preprocessor() -> ColumnTransformer:
-    if FEATURE_MODE != "scale_all":
-        raise ValueError(f"Unsupported FEATURE_MODE: {FEATURE_MODE}")
-    return ColumnTransformer([("scale", StandardScaler(), INPUT_COLUMNS)], remainder="drop")
+def build_preprocessor(mode: str) -> ColumnTransformer:
+    if mode == "raw":
+        return ColumnTransformer([("raw", "passthrough", INPUT_COLUMNS)], remainder="drop")
+    if mode == "scale_all":
+        return ColumnTransformer([("scale", StandardScaler(), INPUT_COLUMNS)], remainder="drop")
+    raise ValueError(f"Unsupported feature mode: {mode}")
 
 
-def train_gylis_model(df: pd.DataFrame) -> tuple[ColumnTransformer, HistGradientBoostingRegressor]:
-    train_df = df.dropna(subset=INPUT_COLUMNS + [TARGET_COLUMN]).reset_index(drop=True)
+def build_kernel(params: dict) -> ConstantKernel:
+    length_scale = np.array(
+        [
+            float(params["length_scale_n"]),
+            float(params["length_scale_p"]),
+            float(params["length_scale_f0"]),
+        ],
+        dtype=float,
+    )
+    return (
+        ConstantKernel(
+            constant_value=float(params["c_value"]),
+            constant_value_bounds="fixed",
+        )
+        * Matern(
+            length_scale=length_scale,
+            length_scale_bounds="fixed",
+            nu=float(params["matern_nu"]),
+        )
+        + WhiteKernel(
+            noise_level=float(params["noise_level"]),
+            noise_level_bounds="fixed",
+        )
+    )
+
+
+def train_gp_model(
+    df: pd.DataFrame,
+    target_column: str,
+    feature_mode: str,
+    use_log_target: bool,
+    params: dict,
+) -> tuple[ColumnTransformer, GaussianProcessRegressor]:
+    train_df = df.dropna(subset=INPUT_COLUMNS + [target_column]).reset_index(drop=True)
     if train_df.empty:
-        raise ValueError("No rows available to train Gylis model.")
+        raise ValueError(f"No rows available to train {target_column} model.")
 
     X_df = train_df[INPUT_COLUMNS].copy()
-    y = train_df[TARGET_COLUMN].to_numpy(dtype=float)
-    if USE_LOG_TARGET and np.any(y <= -1.0):
-        raise ValueError("Cannot use log1p target transform because Gylis contains values <= -1.")
-    y_model = np.log1p(y) if USE_LOG_TARGET else y
+    y = train_df[target_column].to_numpy(dtype=float)
+    if use_log_target and np.any(y <= -1.0):
+        raise ValueError(f"Cannot use log1p for {target_column}: found values <= -1.")
+    y_model = np.log1p(y) if use_log_target else y
 
-    preprocessor = build_preprocessor()
+    preprocessor = build_preprocessor(feature_mode)
     X = preprocessor.fit_transform(X_df)
 
-    model = HistGradientBoostingRegressor(
-        loss="squared_error",
-        learning_rate=GYLIS_LEARNING_RATE,
-        max_depth=GYLIS_MAX_DEPTH,
-        max_iter=GYLIS_MAX_ITER,
-        min_samples_leaf=GYLIS_MIN_SAMPLES_LEAF,
-        l2_regularization=GYLIS_L2,
-        max_leaf_nodes=GYLIS_MAX_LEAF_NODES,
-        early_stopping=False,
+    model = GaussianProcessRegressor(
+        kernel=build_kernel(params),
+        alpha=float(params["gpr_alpha"]),
+        optimizer=None,
+        normalize_y=True,
         random_state=0,
     )
     model.fit(X, y_model)
     return preprocessor, model
 
 
-def predict_gylis(
+def predict_target(
     df: pd.DataFrame,
     preprocessor: ColumnTransformer,
-    model: HistGradientBoostingRegressor,
+    model: GaussianProcessRegressor,
+    use_log_target: bool,
 ) -> tuple[list[float], int]:
     preds: list[float] = []
     skipped = 0
@@ -77,19 +126,24 @@ def predict_gylis(
         )
         x = preprocessor.transform(x_df)
         pred_model = float(model.predict(x)[0])
-        pred = float(np.expm1(pred_model)) if USE_LOG_TARGET else pred_model
+        pred = float(np.expm1(pred_model)) if use_log_target else pred_model
         preds.append(pred)
 
     return preds, skipped
 
 
-def write_to_column_h(file_path: Path, preds: list[float]) -> None:
+def write_predictions(file_path: Path, pred_ra: list[float], pred_gylis: list[float]) -> None:
     wb = load_workbook(file_path)
     ws = wb.active
 
+    # Column C (3): predicted Ra
+    ws.cell(row=1, column=3, value="Pred_Ra")
+    for excel_row, value in enumerate(pred_ra, start=2):
+        ws.cell(row=excel_row, column=3, value=None if pd.isna(value) else float(value))
+
     # Column H (8): predicted Gylis
     ws.cell(row=1, column=8, value="Pred_Gylis")
-    for excel_row, value in enumerate(preds, start=2):
+    for excel_row, value in enumerate(pred_gylis, start=2):
         ws.cell(row=excel_row, column=8, value=None if pd.isna(value) else float(value))
 
     wb.save(file_path)
@@ -98,8 +152,8 @@ def write_to_column_h(file_path: Path, preds: list[float]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Train fixed Gylis HistGradientBoostingRegressor (best-balance params) "
-            "and write predicted Gylis to column H in surikiuoti_duomenys_Nscan_3.xlsx."
+            "Train fixed ARD Matern(2.5) GP models for Ra and Gylis and write "
+            "Pred_Ra to column C and Pred_Gylis to column H."
         )
     )
     parser.add_argument("--file", type=str, default="surikiuoti_duomenys_Nscan_3.xlsx")
@@ -111,29 +165,53 @@ def main() -> None:
         raise FileNotFoundError(f"File not found: {file_path}")
 
     df = pd.read_excel(file_path)
-    missing = [col for col in INPUT_COLUMNS + [TARGET_COLUMN] if col not in df.columns]
+    required_columns = INPUT_COLUMNS + [RA_TARGET, GYLIS_TARGET]
+    missing = [col for col in required_columns if col not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    print("Training fixed Gylis model...")
-    preprocessor, model = train_gylis_model(df)
-    preds, skipped = predict_gylis(df, preprocessor, model)
-    print(f"Rows total: {len(df)}")
-    print(f"Rows skipped (missing inputs): {skipped}")
-    print("Write target: column H (8)")
-    print(
-        "Config: "
-        f"feature_mode={FEATURE_MODE}, log_target={USE_LOG_TARGET}, "
-        f"lr={GYLIS_LEARNING_RATE}, depth={GYLIS_MAX_DEPTH}, iter={GYLIS_MAX_ITER}, "
-        f"leaf={GYLIS_MIN_SAMPLES_LEAF}, l2={GYLIS_L2}, max_leaf_nodes={GYLIS_MAX_LEAF_NODES}"
+    print("Training fixed Ra model (Matern 2.5 ARD)...")
+    ra_preprocessor, ra_model = train_gp_model(
+        df=df,
+        target_column=RA_TARGET,
+        feature_mode=RA_FEATURE_MODE,
+        use_log_target=RA_USE_LOG_TARGET,
+        params=RA_PARAMS,
     )
+
+    print("Training fixed Gylis model (Matern 2.5 ARD)...")
+    gylis_preprocessor, gylis_model = train_gp_model(
+        df=df,
+        target_column=GYLIS_TARGET,
+        feature_mode=GYLIS_FEATURE_MODE,
+        use_log_target=GYLIS_USE_LOG_TARGET,
+        params=GYLIS_PARAMS,
+    )
+
+    pred_ra, skipped_ra = predict_target(
+        df=df,
+        preprocessor=ra_preprocessor,
+        model=ra_model,
+        use_log_target=RA_USE_LOG_TARGET,
+    )
+    pred_gylis, skipped_gylis = predict_target(
+        df=df,
+        preprocessor=gylis_preprocessor,
+        model=gylis_model,
+        use_log_target=GYLIS_USE_LOG_TARGET,
+    )
+
+    print(f"Rows total: {len(df)}")
+    print(f"Rows skipped for Ra prediction (missing inputs): {skipped_ra}")
+    print(f"Rows skipped for Gylis prediction (missing inputs): {skipped_gylis}")
+    print("Write targets: Pred_Ra -> column C (3), Pred_Gylis -> column H (8)")
 
     if args.dry_run:
         print("Dry-run: no write performed.")
         return
 
-    write_to_column_h(file_path=file_path, preds=preds)
-    print(f"Done. Predicted Gylis written to column H in {file_path}.")
+    write_predictions(file_path=file_path, pred_ra=pred_ra, pred_gylis=pred_gylis)
+    print(f"Done. Predictions written to column C and H in {file_path}.")
 
 
 if __name__ == "__main__":
